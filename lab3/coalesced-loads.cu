@@ -36,7 +36,7 @@ __global__ void non_coalesced_load(data_type *dst, data_type *src, int x) {
 
 __global__ void coalesced_load(data_type *dst, data_type *src, int x) {
     int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x;
+    int stride = blockDim.x * gridDim.x;
     for (int i = 0; i < x; ++i) {
         dst[thread_id + i * stride] = src[thread_id + i * stride];
     }
