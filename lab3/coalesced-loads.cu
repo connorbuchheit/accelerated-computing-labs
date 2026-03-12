@@ -35,10 +35,11 @@ __global__ void non_coalesced_load(data_type *dst, data_type *src, int x) {
 // Coalesced Memory Access Pattern
 
 __global__ void coalesced_load(data_type *dst, data_type *src, int x) {
-    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
+    int thread_id = threadIdx.x;
+    int stride = blockDim.x;
+    int block_offset = blockIdx.x * blockDim.x * x;
     for (int i = 0; i < x; ++i) {
-        dst[thread_id + i * stride] = src[thread_id + i * stride];
+        dst[block_offset + thread_id + i * stride] = src[block_offset + thread_id + i * stride];
     }
 }
 
