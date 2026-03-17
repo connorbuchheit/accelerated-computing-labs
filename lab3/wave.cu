@@ -236,11 +236,91 @@ std::pair<float *, float *> wave_gpu_naive(
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Shared Memory)
 
-template <typename Scene>
+template <typename Scene, int32_t S>
 __global__ void wave_gpu_shmem_multistep(
-    /* TODO: your arguments here... */
+    float t0,
+    float *u0,      /* pointer to GPU memory: u(t0 - dt) */
+    float *u1       /* pointer to GPU memory: u(t0)      */
 ) {
-    /* TODO: your GPU code here... */
+    constexpr int32_t n_cells_x = Scene::n_cells_x;
+    constexpr int32_t n_cells_y = Scene::n_cells_y;
+    constexpr float c = Scene::c;
+    constexpr float dx = Scene::dx;
+    constexpr float dt = Scene::dt;
+
+    const int32_t T = blockDim.x; // tile side, T = B + 2*S
+    const int32_t B = T - 2 * S; // output side written per launch
+
+    extern __shared__ float shmem[];
+    float *sm_prev = shmem;         // u(t0 - dt) in tile
+    float *sm_curr = shmem + T * T; // u(t0)      in tile
+
+    int32_t tx = threadIdx.x;
+    int32_t ty = threadIdx.y;
+
+    // Global coords for this thread (may fall outside domain — clamped for loads)
+    int32_t gx = blockIdx.x * B + tx - S;
+    int32_t gy = blockIdx.y * B + ty - S;
+
+    // Clamp to domain bounds for the initial global memory load
+    int32_t cgx = max(0, min(n_cells_x - 1, gx));
+    int32_t cgy = max(0, min(n_cells_y - 1, gy));
+
+    sm_prev[ty * T + tx] = u0[cgy * n_cells_x + cgx];
+    sm_curr[ty * T + tx] = u1[cgy * n_cells_x + cgx];
+    // All threads must finish loading shmem before any thread reads neighbors.
+    __syncthreads();
+
+    for (int32_t step = 0; step < S; ++step) {
+        float t = t0 + step * dt;
+
+        // Valid region shrinks by 1 on each side per sub-step (diamond tiling)
+        bool in_valid = (tx > step && tx < T - 1 - step &&
+                         ty > step && ty < T - 1 - step);
+
+        float new_val;
+        if (!in_valid) {
+            new_val = sm_curr[ty * T + tx];
+        } else {
+            bool is_border = (gx <= 0 || gx >= n_cells_x - 1 ||
+                              gy <= 0 || gy >= n_cells_y - 1);
+
+            if (is_border || Scene::is_wall(gx, gy)) {
+                new_val = 0.0f;
+            } else if (Scene::is_source(gx, gy)) {
+                new_val = Scene::source_value(gx, gy, t);
+            } else {
+                constexpr float coeff = c * c * dt * dt / (dx * dx);
+                float damping = Scene::damping(gx, gy);
+                float center = sm_curr[ty * T + tx];
+                float left   = sm_curr[ty * T + (tx - 1)];
+                float right  = sm_curr[ty * T + (tx + 1)];
+                float up     = sm_curr[(ty - 1) * T + tx];
+                float down   = sm_curr[(ty + 1) * T + tx];
+                float prev   = sm_prev[ty * T + tx];
+                new_val = (2.0f - damping - 4.0f * coeff) * center
+                        - (1.0f - damping) * prev
+                        + coeff * (left + right + up + down);
+            }
+        }
+
+        __syncthreads();
+        // Advance buffers: sm_prev <- sm_curr, sm_curr <- new_val
+        sm_prev[ty * T + tx] = sm_curr[ty * T + tx];
+        sm_curr[ty * T + tx] = new_val;
+        __syncthreads();
+    }
+
+    // Write back only the B×B output region.
+    // After S sub-steps: sm_prev = u(t0 + (S-1)*dt), sm_curr = u(t0 + S*dt).
+    if (tx >= S && tx < T - S && ty >= S && ty < T - S) {
+        int32_t out_gx = blockIdx.x * B + (tx - S);
+        int32_t out_gy = blockIdx.y * B + (ty - S);
+        if (out_gx < n_cells_x && out_gy < n_cells_y) {
+            u0[out_gy * n_cells_x + out_gx] = sm_prev[ty * T + tx];
+            u1[out_gy * n_cells_x + out_gx] = sm_curr[ty * T + tx];
+        }
+    }
 }
 
 // 'wave_gpu_shmem':
@@ -276,7 +356,43 @@ std::pair<float *, float *> wave_gpu_shmem(
     float *extra0, /* pointer to GPU memory */
     float *extra1  /* pointer to GPU memory */
 ) {
-    /* TODO: your CPU code here... */
+    constexpr int32_t S = 6; // steps per launch
+    constexpr int32_t B = 9; // output cells committed per block side
+    constexpr int32_t T = B + 2 * S; // tile side loaded into shmem
+
+    dim3 block_size(T, T);
+    dim3 num_blocks((Scene::n_cells_x + B - 1) / B,
+                    (Scene::n_cells_y + B - 1) / B);
+    uint32_t shmem_bytes = 2 * T * T * sizeof(float);
+
+    CUDA_CHECK(cudaFuncSetAttribute(
+        wave_gpu_shmem_multistep<Scene, S>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_bytes));
+
+    int32_t full_launches = n_steps / S;
+    int32_t remainder = n_steps % S;
+
+    for (int32_t i = 0; i < full_launches; ++i) {
+        float t = t0 + i * S * Scene::dt;
+        wave_gpu_shmem_multistep<Scene, S><<<num_blocks, block_size, shmem_bytes>>>(t, u0, u1);
+        // Kernel writes both u0 and u1 back in-place; no pointer swap needed.
+    }
+
+    // Handle remainder steps with the naive kernel to avoid a mismatched
+    // block/tile size (a remainder-specific T would differ from the shmem T).
+    // After each naive step u0 holds the new state, then we swap like wave_gpu_naive.
+    {
+        dim3 naive_block_size(16, 16);
+        dim3 naive_num_blocks((Scene::n_cells_x + 15) / 16,
+                              (Scene::n_cells_y + 15) / 16);
+        for (int32_t i = 0; i < remainder; ++i) {
+            float t = t0 + (full_launches * S + i) * Scene::dt;
+            wave_gpu_naive_step<Scene><<<naive_num_blocks, naive_block_size>>>(t, u0, u1);
+            std::swap(u0, u1);
+        }
+    }
+
     return {u0, u1};
 }
 
