@@ -103,6 +103,17 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
+// Block tile: each block computes a BM x BN tile of C
+// Thread microtile: each thread computes TM x TN outputs
+// K is processed in chunks of BK
+static constexpr int BM = 128;
+static constexpr int BN = 128;
+static constexpr int BK = 16;
+static constexpr int TM = 8;
+static constexpr int TN = 8;
+// Threads per block: (BM/TM) * (BN/TN) = 16 * 16 = 256
+static constexpr int THREADS = (BM / TM) * (BN / TN);
+
 __global__ void matmul_l1_reg(
     int32_t size_i,
     int32_t size_j,
@@ -110,7 +121,85 @@ __global__ void matmul_l1_reg(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your GPU code here */
+
+    __shared__ float tile_a[BM * BK]; // BM rows x BK cols
+    __shared__ float tile_b[BK * BN]; // BK rows x BN cols
+
+    // Which block-level tile of C this block owns
+    int block_row = blockIdx.y * BM;
+    int block_col = blockIdx.x * BN;
+
+    // Which microtile within the block this thread owns
+    int thread_row = threadIdx.x / (BN / TN); // row index of microtile
+    int thread_col = threadIdx.x % (BN / TN); // col index of microtile
+
+    // Register accumulator for the TM x TN microtile
+    float acc[TM][TN] = {};
+
+    // Each thread also keeps TM values of A and TN values of B in registers
+    float reg_a[TM];
+    float reg_b[TN];
+
+    // Loading tile_a: BM*BK = 128*16 = 2048 elements, each thread loads 2048/256 = 8
+    // Loading tile_b: BK*BN = 16*128 = 2048 elements, each thread loads 8
+    constexpr int A_STRIDE = THREADS;
+    constexpr int A_PER_THREAD = BM * BK / THREADS; // = 8
+    constexpr int B_PER_THREAD = BK * BN / THREADS; // = 8
+
+    for (int k = 0; k < size_k; k += BK) {
+        // Cooperatively load tile of A: shape BM x BK
+        for (int i = 0; i < A_PER_THREAD; ++i) {
+            int idx = threadIdx.x + i * A_STRIDE;
+            int row = idx / BK;
+            int col = idx % BK;
+            int g_row = block_row + row;
+            int g_col = k + col;
+            tile_a[row * BK + col] = (g_row < size_i && g_col < size_k) ? a[g_row * size_k + g_col] : 0.0f;
+        }
+
+        // Cooperatively load tile of B: shape BK x BN
+        for (int i = 0; i < B_PER_THREAD; ++i) {
+            int idx = threadIdx.x + i * A_STRIDE;
+            int row = idx / BN;
+            int col = idx % BN;
+            int g_row = k + row;
+            int g_col = block_col + col;
+            tile_b[row * BN + col] = (g_row < size_k && g_col < size_j) ? b[g_row * size_j + g_col] : 0.0f;
+        }
+
+        __syncthreads();
+
+        // Each thread computes its TM x TN microtile using data from shmem -> registers
+        for (int kk = 0; kk < BK; ++kk) {
+            // Load TM values from this thread's rows of tile_a into registers
+            for (int m = 0; m < TM; ++m) {
+                reg_a[m] = tile_a[(thread_row * TM + m) * BK + kk];
+            }
+            // Load TN values from this thread's cols of tile_b into registers
+            for (int n = 0; n < TN; ++n) {
+                reg_b[n] = tile_b[kk * BN + thread_col * TN + n];
+            }
+            // Outer product into accumulator — all operands in registers
+            for (int m = 0; m < TM; ++m) {
+                for (int n = 0; n < TN; ++n) {
+                    acc[m][n] += reg_a[m] * reg_b[n];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write TM x TN results to C
+    for (int m = 0; m < TM; ++m) {
+        for (int n = 0; n < TN; ++n) {
+            int g_row = block_row + thread_row * TM + m;
+            int g_col = block_col + thread_col * TN + n;
+            if (g_row < size_i && g_col < size_j) {
+                c[g_row * size_j + g_col] = acc[m][n];
+            }
+        }
+    }
 }
 
 void launch_matmul_l1_reg(
@@ -120,7 +209,10 @@ void launch_matmul_l1_reg(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your CPU code here */
+    dim3 grid((size_j + BN - 1) / BN, (size_i + BM - 1) / BM);
+    dim3 block(THREADS);
+    size_t shmem = (BM * BK + BK * BN) * sizeof(float);
+    matmul_l1_reg<<<grid, block, shmem>>>(size_i, size_j, size_k, a, b, c);
 }
 
 }; // namespace matmul_l1_reg
